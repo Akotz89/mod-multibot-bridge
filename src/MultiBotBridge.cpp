@@ -232,6 +232,7 @@ char const* const kOutfitFramingCapability = "OUTFIT_FRAMING_V1";
 std::size_t constexpr kMaxOutfitFrameSets = 128;
 std::size_t constexpr kMaxOutfitFramePartsPerSet = 128;
 char const* const kInventoryCapability = "INVENTORY_V1";
+char const* const kEquipObserveCapability = "EQUIP_OBSERVE_V1";
 char const* const kInventoryExactCapability = "INVENTORY_EXACT_V1";
 char const* const kInventoryItemMoveCapability = "ITEM_MOVE_V1";
 char const* const kInventoryItemTradeCapability = "ITEM_TRADE_V1";
@@ -262,11 +263,13 @@ char const* const kBotGroupRemoveCapability = "BOT_GROUP_REMOVE_V1";
 char const* const kBotGroupLifecycleCapability = "BOT_GROUP_LIFECYCLE_V1";
 char const* const kCreatorAddClassCapability = "CREATOR_ADDCLASS_V1";
 char const* const kCreatorInitAutoCapability = "CREATOR_INIT_AUTO_V1";
+char const* const kCreatorInitAutoFeedbackCapability = "CREATOR_INIT_AUTO_FEEDBACK_V1";
 std::chrono::seconds constexpr kCreatorInitAutoRateWindow(3);
 std::size_t constexpr kCreatorInitAutoMaxRequesterStates = 512;
 char const* const kBotTargetResolveCapability = "BOT_TARGET_RESOLVE_V1";
 char const* const kFollowOrderCapability = "FOLLOW_ORDER_V1";
 char const* const kStayOrderCapability = "STAY_ORDER_V1";
+char const* const kGrindOrderCapability = "GRIND_ORDER_V1";
 char const* const kAttackOrderCapability = "ATTACK_ORDER_V1";
 char const* const kHunterPetControlCapability = "HUNTER_PET_CONTROL_V1";
 char const* const kHunterPetManageCapability = "HUNTER_PET_MANAGE_V1";
@@ -352,6 +355,7 @@ void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const
 void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedFormation);
 void RunFollowOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
 void RunStayOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
+void RunGrindOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
 void RunAttackOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& audienceValue);
 void RunHunterPetControlCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue);
 void RunHunterPetManageCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& argumentValue);
@@ -413,6 +417,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kOutfitCapability,
         kOutfitFramingCapability,
         kInventoryCapability,
+        kEquipObserveCapability,
         kInventoryExactCapability,
         kInventoryItemMoveCapability,
         kInventoryItemTradeCapability,
@@ -443,9 +448,11 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kBotGroupLifecycleCapability,
         kCreatorAddClassCapability,
         kCreatorInitAutoCapability,
+        kCreatorInitAutoFeedbackCapability,
         kBotTargetResolveCapability,
 kFollowOrderCapability,
 kStayOrderCapability,
+kGrindOrderCapability,
 kAttackOrderCapability,
 kHunterPetControlCapability,
 kHunterPetManageCapability,
@@ -9959,6 +9966,102 @@ void RunStayOrderCommand(Player* requester, ChatMsg replyType, std::string const
     RunGroupOrderCommand(requester, replyType, requestToken, false);
 }
 // MB_FOLLOW_STAY_ORDER_V1_END
+// MB_GRIND_ORDER_V1_BEGIN
+bool ApplyNativeGrindOrder(Player* requester, Player* bot)
+{
+    if (!requester || !bot || !requester->IsInWorld() || !bot->IsInWorld())
+        return false;
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        return false;
+    }
+
+    std::string const actionName = "grind chat shortcut";
+    SetPlayerbotFeedbackRoute(botAI, requester, true);
+    bool const executed = botAI->DoSpecificAction(actionName, Event(actionName, "", requester), true);
+    SetPlayerbotFeedbackRoute(botAI, requester, false);
+    if (!executed)
+        return false;
+
+    return botAI->HasStrategy("grind", BOT_STATE_NON_COMBAT) &&
+        !botAI->HasStrategy("passive", BOT_STATE_NON_COMBAT) &&
+        !botAI->HasStrategy("stay", BOT_STATE_NON_COMBAT);
+}
+
+void RunGrindOrderCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken)
+{
+    char const* const ackOpcode = "GRIND_ORDER_ACK";
+    std::string const token = Trim(requestToken);
+
+    if (!requester || !IsValidRequestToken(token))
+    {
+        SendGroupOrderAck(requester, replyType, ackOpcode, token, 0, 0, 0, "BAD_TOKEN");
+        return;
+    }
+
+    if (!ConsumeGroupOrderRateLimit(requester))
+    {
+        SendGroupOrderAck(requester, replyType, ackOpcode, token, 0, 0, 0, "RATE_LIMIT");
+        return;
+    }
+
+    if (!RegisterGroupOrderToken(requester, token))
+    {
+        SendGroupOrderAck(requester, replyType, ackOpcode, token, 0, 0, 0, "REPLAY");
+        return;
+    }
+
+    Group* const requesterGroup = requester->GetGroup();
+    if (!requesterGroup)
+    {
+        SendGroupOrderAck(requester, replyType, ackOpcode, token, 0, 0, 0, "NO_GROUP");
+        return;
+    }
+
+    uint32 matched = 0;
+    uint32 succeeded = 0;
+    uint32 failed = 0;
+    bool limitExceeded = false;
+
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+    {
+        if (!bot || bot->GetGroup() != requesterGroup)
+            continue;
+
+        if (matched >= kGroupOrderMaxMatchedBots)
+        {
+            limitExceeded = true;
+            break;
+        }
+
+        ++matched;
+        if (ApplyNativeGrindOrder(requester, bot))
+            ++succeeded;
+        else
+            ++failed;
+    }
+
+    std::string reason = "OK";
+    if (limitExceeded)
+        reason = "BOT_LIMIT";
+    else if (matched == 0)
+        reason = "NO_BOTS";
+    else if (failed == 0)
+        reason = "OK";
+    else if (succeeded > 0)
+        reason = "PARTIAL";
+    else
+        reason = "FAILED";
+
+    SendGroupOrderAck(requester, replyType, ackOpcode, token, matched, succeeded, failed, reason);
+}
+// MB_GRIND_ORDER_V1_END
 // MB_HUNTER_PET_CONTROL_V1_BEGIN
 bool IsAllowedHunterPetControlAction(std::string const& action)
 {
@@ -18024,6 +18127,136 @@ enum class CreatorInitAutoOutcome
     Failed
 };
 
+// MB_CREATOR_INIT_AUTO_FEEDBACK_V1_BEGIN
+struct CreatorInitAutoFeedbackSnapshot
+{
+    std::set<ObjectGuid> equippedItemGuids;
+    uint32 ammoEntry = 0;
+};
+
+struct CreatorInitAutoFeedbackItem
+{
+    std::string kind;
+    std::string itemLink;
+};
+
+CreatorInitAutoFeedbackSnapshot BuildCreatorInitAutoFeedbackSnapshot(Player* bot)
+{
+    CreatorInitAutoFeedbackSnapshot snapshot;
+    if (!bot)
+        return snapshot;
+
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        if (Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            snapshot.equippedItemGuids.insert(item->GetGUID());
+
+    for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
+        if (Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            snapshot.equippedItemGuids.insert(item->GetGUID());
+
+    snapshot.ammoEntry = bot->GetUInt32Value(PLAYER_AMMO_ID);
+    return snapshot;
+}
+
+std::vector<CreatorInitAutoFeedbackItem> BuildCreatorInitAutoFeedbackItems(
+    Player* bot,
+    CreatorInitAutoFeedbackSnapshot const& before)
+{
+    std::vector<CreatorInitAutoFeedbackItem> items;
+    if (!bot)
+        return items;
+
+    auto appendNewItem = [&](Item* item, char const* kind)
+    {
+        if (!item || before.equippedItemGuids.find(item->GetGUID()) != before.equippedItemGuids.end())
+            return;
+
+        ItemTemplate const* const proto = item->GetTemplate();
+        if (!proto)
+            return;
+
+        CreatorInitAutoFeedbackItem feedback;
+        feedback.kind = kind;
+        feedback.itemLink = ChatHelper::FormatItem(proto, 1);
+        if (!feedback.itemLink.empty())
+            items.push_back(feedback);
+    };
+
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        appendNewItem(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot), "EQUIP");
+
+    for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
+        appendNewItem(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot), "BAG");
+
+    uint32 const afterAmmo = bot->GetUInt32Value(PLAYER_AMMO_ID);
+    if (afterAmmo && afterAmmo != before.ammoEntry)
+    {
+        if (ItemTemplate const* const proto = sObjectMgr->GetItemTemplate(afterAmmo))
+        {
+            CreatorInitAutoFeedbackItem feedback;
+            feedback.kind = "AMMO";
+            feedback.itemLink = ChatHelper::FormatItem(proto, 1);
+            if (!feedback.itemLink.empty())
+                items.push_back(feedback);
+        }
+    }
+
+    return items;
+}
+
+bool SendCreatorInitAutoFeedbackItemPacket(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& botName,
+    CreatorInitAutoFeedbackItem const& item)
+{
+    if (!requester || !IsValidRequestToken(requestToken) || botName.empty() || botName.size() > kMaxBotNameLength)
+        return false;
+
+    if (item.kind != "EQUIP" && item.kind != "BAG" && item.kind != "AMMO")
+        return false;
+
+    std::string const encodedBotName = UrlEncodeField(botName);
+    std::string const encodedItemLink = UrlEncodeField(item.itemLink);
+    if (encodedBotName.size() > kMaxEncodedFieldLength || encodedItemLink.size() > kMaxEncodedFieldLength)
+        return false;
+
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << encodedBotName
+        << kFieldSeparator << item.kind
+        << kFieldSeparator << encodedItemLink;
+
+    return SendStateAddonPacket(requester, replyType, "CREATOR_INIT_AUTO_ITEM", payload.str());
+}
+
+void SendCreatorInitAutoFeedbackPackets(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    Player* bot,
+    CreatorInitAutoFeedbackSnapshot const& before)
+{
+    if (!requester || !bot)
+        return;
+
+    std::vector<CreatorInitAutoFeedbackItem> const items = BuildCreatorInitAutoFeedbackItems(bot, before);
+    for (CreatorInitAutoFeedbackItem const& item : items)
+    {
+        if (!SendCreatorInitAutoFeedbackItemPacket(requester, replyType, requestToken, bot->GetName(), item))
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge CREATOR_INIT_AUTO_ITEM skipped player={} bot={} kind={} reason=PACKET_BUDGET",
+                requester->GetName(),
+                bot->GetName(),
+                item.kind);
+        }
+    }
+}
+// MB_CREATOR_INIT_AUTO_FEEDBACK_V1_END
+
 bool ConsumeCreatorInitAutoRateLimit(Player* requester)
 {
     using Clock = std::chrono::steady_clock;
@@ -18190,7 +18423,8 @@ void RunCreatorInitAutoTarget(
         return;
     }
 
-    if (!mgr->GetPlayerBot(targetGuid))
+    Player* const botBefore = mgr->GetPlayerBot(targetGuid);
+    if (!botBefore)
     {
         SendCreatorInitAutoResultPacket(
             requester, replyType, requestToken, "TARGET",
@@ -18198,7 +18432,11 @@ void RunCreatorInitAutoTarget(
         return;
     }
 
+    CreatorInitAutoFeedbackSnapshot const feedbackBefore = BuildCreatorInitAutoFeedbackSnapshot(botBefore);
     std::string result = RunCreatorInitAutoForGuid(mgr, requester, targetGuid);
+    if (Player* const botAfter = mgr->GetPlayerBot(targetGuid))
+        SendCreatorInitAutoFeedbackPackets(requester, replyType, requestToken, botAfter, feedbackBefore);
+
     std::string reason;
     CreatorInitAutoOutcome const outcome = ClassifyCreatorInitAutoResult(result, reason);
 
@@ -18257,13 +18495,18 @@ void RunCreatorInitAutoGroup(
 
         ++total;
 
-        if (!mgr->GetPlayerBot(memberGuid))
+        Player* const botBefore = mgr->GetPlayerBot(memberGuid);
+        if (!botBefore)
         {
             ++skipped;
             continue;
         }
 
+        CreatorInitAutoFeedbackSnapshot const feedbackBefore = BuildCreatorInitAutoFeedbackSnapshot(botBefore);
         std::string result = RunCreatorInitAutoForGuid(mgr, requester, memberGuid);
+        if (Player* const botAfter = mgr->GetPlayerBot(memberGuid))
+            SendCreatorInitAutoFeedbackPackets(requester, replyType, requestToken, botAfter, feedbackBefore);
+
         std::string reason;
         CreatorInitAutoOutcome const outcome = ClassifyCreatorInitAutoResult(result, reason);
 
@@ -19524,6 +19767,156 @@ void RunSelfBotCommand(
 }
 // MB_ISSUE33_SELF_BOT_V1_END
 
+// MB_INVENTORY_H1B1A_EQUIP_OBSERVE_V1_BEGIN
+// Read-only Playerbots equipment observer. No AzerothCore equip hook is used.
+struct EquipObserveItemState
+{
+    uint64 guidCounter = 0;
+    uint32 itemId = 0;
+};
+struct EquipObserveBotState
+{
+    std::array<EquipObserveItemState, EQUIPMENT_SLOT_END> slots = {};
+    uint32 mapId = 0;
+    std::chrono::steady_clock::time_point seenAt = {};
+};
+std::map<std::pair<uint32, uint32>, EquipObserveBotState> sEquipObserveSnapshots;
+std::map<uint32, std::chrono::steady_clock::time_point> sEquipObserveLastRequest;
+
+std::array<EquipObserveItemState, EQUIPMENT_SLOT_END> ReadEquipObserveSlots(PlayerbotAI* botAI)
+{
+    std::array<EquipObserveItemState, EQUIPMENT_SLOT_END> slots = {};
+    if (!botAI)
+        return slots;
+
+    // Playerbots native API: inventory and equipped items in one read-only list.
+    for (Item* const item : botAI->GetInventoryAndEquippedItems())
+    {
+        if (!item || item->GetBagSlot() != INVENTORY_SLOT_BAG_0)
+            continue;
+        uint8 const slot = item->GetSlot();
+        if (slot < EQUIPMENT_SLOT_START || slot >= EQUIPMENT_SLOT_END)
+            continue;
+        slots[slot].guidCounter = static_cast<uint64>(item->GetGUID().GetCounter());
+        slots[slot].itemId = item->GetEntry();
+    }
+    return slots;
+}
+
+void SendEquipObserveDone(Player* requester, ChatMsg replyType,
+    std::string const& encodedBotName, std::string const& token, char const* status)
+{
+    if (!requester)
+        return;
+    SendStateAddonPacket(requester, replyType, "EQUIP_OBSERVE_DONE",
+        encodedBotName + std::string(1, kFieldSeparator) + token +
+        std::string(1, kFieldSeparator) + status);
+}
+
+void ObserveBotEquipment(Player* requester, ChatMsg replyType,
+    std::string const& botName, std::string const& token)
+{
+    if (!requester)
+        return;
+
+    std::string const encodedName = UrlEncodeField(botName);
+    Player* const bot = FindBotByName(requester, botName);
+    if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported())
+    {
+        SendEquipObserveDone(requester, replyType, encodedName, token, "NO_BOT");
+        return;
+    }
+
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        SendEquipObserveDone(requester, replyType, encodedName, token, "FORBIDDEN");
+        return;
+    }
+
+    auto const now = std::chrono::steady_clock::now();
+    uint32 const requesterKey = requester->GetGUID().GetCounter();
+    auto const previousRequest = sEquipObserveLastRequest.find(requesterKey);
+    if (previousRequest != sEquipObserveLastRequest.end() &&
+        now - previousRequest->second < std::chrono::milliseconds(1000))
+    {
+        SendEquipObserveDone(requester, replyType, encodedName, token, "RATE_LIMIT");
+        return;
+    }
+    sEquipObserveLastRequest[requesterKey] = now;
+
+    // Bounded cache with TTL: never retain object pointers across requests.
+    if (sEquipObserveSnapshots.size() >= 256)
+    {
+        for (auto it = sEquipObserveSnapshots.begin(); it != sEquipObserveSnapshots.end();)
+        {
+            if (now - it->second.seenAt >= std::chrono::seconds(60))
+                it = sEquipObserveSnapshots.erase(it);
+            else
+                ++it;
+        }
+        if (sEquipObserveSnapshots.size() >= 256)
+            sEquipObserveSnapshots.erase(sEquipObserveSnapshots.begin());
+    }
+    if (sEquipObserveLastRequest.size() >= 512)
+    {
+        for (auto it = sEquipObserveLastRequest.begin(); it != sEquipObserveLastRequest.end();)
+        {
+            if (now - it->second >= std::chrono::seconds(60))
+                it = sEquipObserveLastRequest.erase(it);
+            else
+                ++it;
+        }
+        if (sEquipObserveLastRequest.size() >= 512)
+            sEquipObserveLastRequest.erase(sEquipObserveLastRequest.begin());
+    }
+
+    auto const current = ReadEquipObserveSlots(botAI);
+    auto const key = std::make_pair(requesterKey, bot->GetGUID().GetCounter());
+    auto const existing = sEquipObserveSnapshots.find(key);
+    if (existing == sEquipObserveSnapshots.end() ||
+        existing->second.mapId != bot->GetMapId() ||
+        now - existing->second.seenAt >= std::chrono::seconds(60))
+    {
+        EquipObserveBotState initial;
+        initial.slots = current;
+        initial.mapId = bot->GetMapId();
+        initial.seenAt = now;
+        sEquipObserveSnapshots[key] = initial;
+        SendEquipObserveDone(requester, replyType, encodedName, token, "BASELINE");
+        return;
+    }
+
+    EquipObserveBotState& baseline = existing->second;
+    // At most six events in one response; untouched slots remain pending for
+    // the next observation, preventing a packet burst after a full regear.
+    std::size_t emitted = 0;
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END && emitted < 6; ++slot)
+    {
+        EquipObserveItemState const& oldItem = baseline.slots[slot];
+        EquipObserveItemState const& newItem = current[slot];
+        if (oldItem.guidCounter == newItem.guidCounter && oldItem.itemId == newItem.itemId)
+            continue;
+
+        std::ostringstream payload;
+        payload << encodedName << kFieldSeparator << token
+                << kFieldSeparator << static_cast<uint32>(slot)
+                << kFieldSeparator << oldItem.itemId
+                << kFieldSeparator << newItem.itemId;
+        if (!SendStateAddonPacket(requester, replyType, "EQUIP_OBSERVE_ITEM", payload.str()))
+        {
+            SendEquipObserveDone(requester, replyType, encodedName, token, "WIRE_LIMIT");
+            return;
+        }
+        baseline.slots[slot] = newItem;
+        ++emitted;
+    }
+    baseline.seenAt = now;
+    SendEquipObserveDone(requester, replyType, encodedName, token, "OK");
+}
+// MB_INVENTORY_H1B1A_EQUIP_OBSERVE_V1_END
+
 bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& opcode, std::string const& payload)
 {
     std::string const trimmedOpcode = Trim(opcode);
@@ -19566,6 +19959,22 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
     if (normalized == "GET")
     {
+        // MB_INVENTORY_H1B1A_GET_EQUIP_OBSERVE_V1_BEGIN
+        if (requestType == "EQUIP_OBSERVE")
+        {
+            std::string const token = GetSafeErrorToken(fields, 2);
+            if (fields.size() != 3)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+            std::string botName;
+            if (!TryUrlDecodeField(fields[1], botName, kMaxBotNameLength, false))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+            if (!IsValidRequestToken(fields[2]))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+            ObserveBotEquipment(player, replyType, botName, fields[2]);
+            return true;
+        }
+        // MB_INVENTORY_H1B1A_GET_EQUIP_OBSERVE_V1_END
+
         if (requestType == "ROSTER")
         {
             if (fields.size() != 1)
@@ -21104,6 +21513,20 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         return true;
     }
     // MB_FOLLOW_STAY_ORDER_V1_DISPATCH_END
+    // MB_GRIND_ORDER_V1_DISPATCH_BEGIN
+    if (requestType == "GRIND_ORDER")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 2)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        RunGrindOrderCommand(player, replyType, fields[1]);
+        return true;
+    }
+    // MB_GRIND_ORDER_V1_DISPATCH_END
 
     // MB_GROUP_ACTION_V1_DISPATCH_BEGIN
     if (requestType == "GROUP_ACTION")
