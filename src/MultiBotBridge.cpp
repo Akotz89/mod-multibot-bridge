@@ -987,8 +987,22 @@ std::string GetRaceName(uint8 raceId)
         case 11:
             return "Draenei";
         default:
-            return "Unknown";
+            break;
     }
+
+    // Races added through ChrRaces on custom servers. English like the names
+    // above, or the server's DBC locale if the DBC files carry no English text.
+    if (ChrRacesEntry const* raceEntry = sChrRacesStore.LookupEntry(raceId))
+    {
+        char const* name = raceEntry->name[LOCALE_enUS];
+        if (!name || !*name)
+            name = raceEntry->name[sWorld->GetDefaultDbcLocale()];
+
+        if (name && *name)
+            return name;
+    }
+
+    return "Unknown";
 }
 
 std::string GetClassName(uint8 classId)
