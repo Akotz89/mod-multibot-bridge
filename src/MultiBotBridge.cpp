@@ -35,6 +35,7 @@
 #include "AiFactory.h"
 #include "Event.h"
 #include "EventProcessor.h"
+#include "Strategy.h"
 #include "Trigger.h"
 #include "Formations.h"
 #include "ScriptedGossip.h"
@@ -12800,6 +12801,39 @@ bool ResolveRogueDpsStrategyAlias(
     return !resolvedChanges.empty() && resolvedChanges.size() <= kMaxCommandLength;
 }
 
+// Resolve Playerbots factory aliases to the canonical names stored by Engine::addStrategy.
+// Keep unknown names unchanged to preserve existing native command behavior.
+bool ResolveStrategyMutationCanonicalNames(
+    PlayerbotAI* botAI,
+    std::vector<StrategyMutationOperation>& operations,
+    std::string& changes)
+{
+    if (!botAI || !botAI->GetAiObjectContext())
+        return false;
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    std::ostringstream normalized;
+    bool first = true;
+    for (StrategyMutationOperation& operation : operations)
+    {
+        if (Strategy* const strategy = context->GetStrategy(operation.name))
+        {
+            std::string const canonicalName = strategy->getName();
+            if (!IsValidStrategyName(canonicalName))
+                return false;
+            operation.name = canonicalName;
+        }
+
+        if (!first)
+            normalized << ',';
+        normalized << (operation.enable ? '+' : '-') << operation.name;
+        first = false;
+    }
+
+    changes = normalized.str();
+    return !changes.empty() && changes.size() <= kMaxCommandLength;
+}
+
 bool VerifyStrategyMutationResult(
     PlayerbotAI* botAI,
     BotState botState,
@@ -13385,6 +13419,9 @@ bool ApplyNativeStrategyMutation(
     {
         return false;
     }
+
+    if (!ResolveStrategyMutationCanonicalNames(botAI, resolvedOperations, resolvedChanges))
+        return false;
 
     bool const isWarlockStoneMutation = IsWarlockStoneStrategyMutation(bot, botState, resolvedOperations);
     if (isWarlockStoneMutation && bot->IsInCombat())
