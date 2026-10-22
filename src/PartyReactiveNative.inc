@@ -193,12 +193,39 @@ bool PartyReactiveCanUseSupply(Player* member, ItemTemplate const* proto, PartyR
            member->GetMaxPower(POWER_MANA) > 0;
 }
 
-uint32 PartyReactiveCount(std::vector<Player*> const& members, uint32 item)
+struct PartyReactiveSupplyInventory
 {
-    uint64 count = 0;
+    uint32 consumers = 0;
+    std::vector<PartyReactive::SupplyStack> stacks;
+};
+
+PartyReactiveSupplyInventory PartyReactiveGetSupplyInventory(std::vector<Player*> const& members,
+                                                              ItemTemplate const* targetProto,
+                                                              PartyReactive::NeedKind need)
+{
+    PartyReactiveSupplyInventory inventory;
     for (Player* const member : members)
-        count += member->GetItemCount(item, false);
-    return static_cast<uint32>(std::min<uint64>(count, std::numeric_limits<uint32>::max()));
+    {
+        if (!PartyReactiveCanUseSupply(member, targetProto, need))
+            continue;
+        ++inventory.consumers;
+        for (Item* const stack : PartyReactiveInventoryItems(member))
+        {
+            ItemTemplate const* const stackProto = stack ? stack->GetTemplate() : nullptr;
+            if (stackProto)
+                inventory.stacks.push_back({stack->GetEntry(), stack->GetCount(), PartyReactiveNeedKind(stackProto),
+                                            PartyReactiveCanUseSupply(member, stackProto, need),
+                                            stack->IsInTrade()});
+        }
+    }
+    return inventory;
+}
+
+uint32 PartyReactiveCount(std::vector<Player*> const& members, uint32 item, PartyReactive::NeedKind need)
+{
+    ItemTemplate const* const proto = sObjectMgr->GetItemTemplate(item);
+    PartyReactiveSupplyInventory const inventory = PartyReactiveGetSupplyInventory(members, proto, need);
+    return PartyReactive::AvailableSupply(inventory.stacks, item, need).item;
 }
 
 bool PartyReactiveSupplyDemand(std::vector<Player*> const& members, uint32 item, uint32& have, uint32& reserve,
@@ -209,27 +236,13 @@ bool PartyReactiveSupplyDemand(std::vector<Player*> const& members, uint32 item,
     if (need == PartyReactive::NeedKind::Quest || need == PartyReactive::NeedKind::Bag)
         return false;
 
-    uint32 consumers = 0;
-    uint64 carried = 0;
-    for (Player* const member : members)
-    {
-        if (!PartyReactiveCanUseSupply(member, proto, need))
-            continue;
-        ++consumers;
-        for (Item* const stack : PartyReactiveInventoryItems(member))
-        {
-            ItemTemplate const* const stackProto = stack ? stack->GetTemplate() : nullptr;
-            if (stackProto && !stack->IsInTrade() && PartyReactiveNeedKind(stackProto) == need &&
-                PartyReactiveCanUseSupply(member, stackProto, need))
-                carried += stack->GetCount();
-        }
-    }
-    uint32 const deficit = PartyReactive::SupplyDeficit(consumers,
-        static_cast<uint32>(std::min<uint64>(carried, std::numeric_limits<uint32>::max())));
-    if (!consumers || !deficit)
+    PartyReactiveSupplyInventory const inventory = PartyReactiveGetSupplyInventory(members, proto, need);
+    PartyReactive::SupplyCounts const counts = PartyReactive::AvailableSupply(inventory.stacks, item, need);
+    uint32 const deficit = PartyReactive::SupplyDeficit(inventory.consumers, counts.category);
+    if (!inventory.consumers || !deficit)
         return false;
 
-    have = PartyReactiveCount(members, item);
+    have = counts.item;
     uint64 const target = uint64(have) + deficit;
     reserve = static_cast<uint32>(std::min<uint64>(target, std::numeric_limits<uint32>::max()));
     return true;
@@ -512,7 +525,7 @@ struct PartyReactiveNative
         return claim.need == PartyReactive::NeedKind::Quest || claim.need == PartyReactive::NeedKind::Reagent ||
                        claim.need == PartyReactive::NeedKind::Bag || claim.need == PartyReactive::NeedKind::Gear
                    ? actor->GetItemCount(claim.item, false)
-                   : PartyReactiveCount(members, claim.item);
+                   : PartyReactiveCount(members, claim.item, claim.need);
     }
 
     void Complete(PartyReactive::Claim const& claim, uint32 increased) const
@@ -792,7 +805,7 @@ void TickPartyReactive(Player* owner)
                                              claim.need == PartyReactive::NeedKind::Bag ||
                                              claim.need == PartyReactive::NeedKind::Gear
                                          ? bot->GetItemCount(claim.item, false)
-                                         : PartyReactiveCount(members, claim.item);
+                                         : PartyReactiveCount(members, claim.item, claim.need);
                     candidate.reserve = claim.reserve;
                     candidate.eligible = true;
                     candidate.kind = claim.kind;

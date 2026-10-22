@@ -314,6 +314,23 @@ void DynamicSupplyDeficitsAndRecipeSelection()
     assert(SupplyDeficit(0xffffffffu, 0) == 0xffffffffu);
     assert(SupplyDeficit(3, 14, 4) == 0);
     assert(SupplyDeficit(3, 8, 4) == 4);
+    std::vector<SupplyStack> stacks = {
+        {101, 4, NeedKind::Food, true, false}, {101, 5, NeedKind::Food, true, true},
+        {202, 6, NeedKind::Food, true, false}, {101, 3, NeedKind::Food, false, false},
+        {101, 8, NeedKind::Drink, true, false}
+    };
+    SupplyCounts const available = AvailableSupply(stacks, 101, NeedKind::Food);
+    assert(available.item == 4 && available.category == 10);
+    std::vector<SupplyStack> overflowing = {
+        {101, 0xffffffffu, NeedKind::Food, true, false}, {101, 1, NeedKind::Food, true, false}
+    };
+    SupplyCounts const saturated = AvailableSupply(overflowing, 101, NeedKind::Food);
+    assert(saturated.item == 0xffffffffu && saturated.category == 0xffffffffu);
+    std::vector<SupplyStack> categoryOverflow = {
+        {101, 0xfffffffeu, NeedKind::Food, true, false}, {202, 2, NeedKind::Food, true, false}
+    };
+    SupplyCounts const categorySaturated = AvailableSupply(categoryOverflow, 101, NeedKind::Food);
+    assert(categorySaturated.item == 0xfffffffeu && categorySaturated.category == 0xffffffffu);
 
     assert(NeedPriority(NeedKind::Quest) > NeedPriority(NeedKind::Reagent));
     assert(NeedPriority(NeedKind::Reagent) > NeedPriority(NeedKind::Food));

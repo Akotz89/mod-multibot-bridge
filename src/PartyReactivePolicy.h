@@ -34,6 +34,34 @@ inline std::uint32_t SupplyDeficit(std::uint32_t consumers, std::uint32_t carrie
     return desired > carried ? desired - carried : 0;
 }
 
+struct SupplyStack
+{
+    std::uint32_t item = 0, count = 0;
+    NeedKind need = NeedKind::Quest;
+    bool usable = false, inTrade = false;
+};
+
+struct SupplyCounts
+{
+    std::uint32_t item = 0, category = 0;
+};
+
+inline SupplyCounts AvailableSupply(std::vector<SupplyStack> const& stacks, std::uint32_t item, NeedKind need)
+{
+    std::uint64_t itemCount = 0, categoryCount = 0;
+    for (SupplyStack const& stack : stacks)
+    {
+        if (!stack.usable || stack.inTrade || stack.need != need)
+            continue;
+        categoryCount += stack.count;
+        if (stack.item == item)
+            itemCount += stack.count;
+    }
+    std::uint64_t const maximum = std::numeric_limits<std::uint32_t>::max();
+    return {static_cast<std::uint32_t>(std::min(itemCount, maximum)),
+            static_cast<std::uint32_t>(std::min(categoryCount, maximum))};
+}
+
 inline std::uint32_t NeedPriority(NeedKind need)
 {
     switch (need)
