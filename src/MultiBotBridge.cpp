@@ -22059,6 +22059,8 @@ if (requestType == "HUNTER_PET_MANAGE")
     return SendProtocolError(player, replyType, normalized, requestType, "", "UNKNOWN_RUN");
 }
 
+#include "PartyReactiveNative.inc"
+
 class MultiBotBridgePlayerScript final : public PlayerScript
 {
 public:
@@ -22114,6 +22116,17 @@ public:
     void OnPlayerJustDied(Player* player) override
     {
         NotifyBotDeath(player);
+        CancelPartyReactiveForPlayer(player, false);
+    }
+
+    void OnPlayerEnterCombat(Player* player, Unit* enemy) override
+    {
+        HandlePartyReactiveCombat(player, enemy);
+    }
+
+    void OnPlayerUpdate(Player* player, uint32 /*diff*/) override
+    {
+        TickPartyReactive(player);
     }
 
     void OnPlayerCreateItem(Player* player, Item* item, uint32 /*count*/) override
@@ -22126,12 +22139,14 @@ public:
     {
         CancelPendingWarlockStoneSwitch(player, "STONE_LOGOUT", false);
         CancelPendingOrdinaryWarlockStoneSwitchesForPlayer(player, "STONE_LOGOUT", false);
+        CancelPartyReactiveForPlayer(player, true);
     }
 
     void OnPlayerMapChanged(Player* player) override
     {
         CancelPendingWarlockStoneSwitch(player, "STONE_MAP_CHANGED", true);
         CancelPendingOrdinaryWarlockStoneSwitchesForPlayer(player, "STONE_MAP_CHANGED", true);
+        CancelPartyReactiveForPlayer(player, false);
     }
 
     bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Player* /*receiver*/) override
